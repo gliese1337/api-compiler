@@ -13,13 +13,16 @@ function *reverseDependencies(deps: Iterable<OpSpec>, params: Set<string>) {
 
 async function calcValue(deps: Map<string, OpSpec>, req: string, vals: { [key: string]: unknown }) {
   if (vals.hasOwnProperty(req)) { return vals[req]; }
-  const op =  deps.get(req);
-  if (!op) { throw new Error(`Cannot calculate ${ req } with given inputs.`); }
-  const args = await Promise.all(op.inputs.map((n) => calcValue(deps, n, vals)));
-  vals[req] = await op.fn(...args);
+  const op = deps.get(req);
+  if (!op) { throw { missing: req }; }
+  const args: unknown[] = await Promise.all(op.inputs.map((n) => calcValue(deps, n, vals)));
+  const val = await op.fn(...args);
+  vals[req] = val;
+  return val;
 }
 
-const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+// tslint:disable-next-line no-empty
+const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 
 export class Compiler {
   private deps = new Map<string, OpSpec>();
@@ -27,7 +30,7 @@ export class Compiler {
 
   constructor(optable: Iterable<Function | OpSpec>) {
     for (const spec of optable) {
-      if (typeof spec !== 'function') {
+      if (typeof spec !== "function") {
         this.deps.set(spec.outputs, spec);
       } else {
         // Extract the name and formal parameters of a formula
@@ -39,10 +42,10 @@ export class Compiler {
           const [ , a, name, argstring ] = match;
 
           this.deps.set(name, {
-            fn: spec,
             async: !!a,
-            outputs: name,
+            fn: spec,
             inputs: argstring.match(/\w+/g) as string[],
+            outputs: name,
           });
         }
       }
@@ -85,11 +88,11 @@ export class Compiler {
     const destructure = Object.entries(pids).map(([ key, value ]) => `'${key}':${ value }`).join(", ");
 
     const calcs = ops.map(({ output, params, async }) => // tslint:disable-line no-shadowed-variable
-      `const ${vids[output]} = ${ async ? 'await' : '' } formulas.${vids[output]}(${ params.map((p) => ids[p]).join(",") });`);
+      `const ${vids[output]} = ${ async ? "await" : "" } formulas.${vids[output]}(${ params.map((p) => ids[p]).join(",") });`);
 
     const retmap = returns.map((v) => `'${ v }':${ ids[v] }`);
 
-    const body = `const ${ destructure } = args;\n${ calcs.join("\n") }\nreturn {${ retmap.join(",") }};`;
+    const body = `const {${ destructure }} = args;\n${ calcs.join("\n") }\nreturn {${ retmap.join(",") }};`;
 
     // Compile the new function and bind statically-required values
 
@@ -148,7 +151,15 @@ export class Compiler {
 
     const ret: { [key: string]: unknown } = {};
     for (const val of reqs) {
-      ret[val] = await calcValue(deps, val, vals);
+      try {
+        ret[val] = await calcValue(deps, val, vals);
+      } catch (e) {
+        if (e.missing) {
+          throw new Error(`Cannot calculate [${ val }]; missing required input [${ e.missing }].`);
+        }
+
+        throw e;
+      }
     }
 
     return ret;
