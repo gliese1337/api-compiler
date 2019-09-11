@@ -1,7 +1,8 @@
 export interface OpSpec {
   inputs: string[];
   outputs: string;
-  fn: (...args: unknown[]) => unknown;
+  fn: Function;
+  async?: boolean;
 }
 
 function *reverseDependencies(deps: Iterable<OpSpec>, params: Set<string>) {
@@ -10,20 +11,41 @@ function *reverseDependencies(deps: Iterable<OpSpec>, params: Set<string>) {
   }
 }
 
-function calcValue(deps: Map<string, OpSpec>, req: string, args: { [key: string]: unknown }) {
-  if (args.hasOwnProperty(req)) { return args[req]; }
+async function calcValue(deps: Map<string, OpSpec>, req: string, vals: { [key: string]: unknown }) {
+  if (vals.hasOwnProperty(req)) { return vals[req]; }
   const op =  deps.get(req);
   if (!op) { throw new Error(`Cannot calculate ${ req } with given inputs.`); }
-  args[req] = op.fn(...op.inputs.map((n) => calcValue(deps, n, args)));
+  const args = await Promise.all(op.inputs.map((n) => calcValue(deps, n, vals)));
+  vals[req] = await op.fn(...args);
 }
+
+const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
 
 export class Compiler {
   private deps = new Map<string, OpSpec>();
   private cache = new Map<string, Function>();
 
-  constructor(optable: Iterable<OpSpec>) {
+  constructor(optable: Iterable<Function | OpSpec>) {
     for (const spec of optable) {
-      this.deps.set(spec.outputs, spec);
+      if (typeof spec !== 'function') {
+        this.deps.set(spec.outputs, spec);
+      } else {
+        // Extract the name and formal parameters of a formula
+        // by parsing the source code, and registers the formula
+        // in the dependencies map.
+        const match = spec.toString()
+          .match(/^(async)?(?:function)?\s*(\w+)\s*(\([\s\S]*?\))*.*/);
+        if (match) {
+          const [ , a, name, argstring ] = match;
+
+          this.deps.set(name, {
+            fn: spec,
+            async: !!a,
+            outputs: name,
+            inputs: argstring.match(/\w+/g) as string[],
+          });
+        }
+      }
     }
   }
 
@@ -62,14 +84,17 @@ export class Compiler {
 
     const destructure = Object.entries(pids).map(([ key, value ]) => `'${key}':${ value }`).join(", ");
 
-    const calcs = ops.map(({ output, params }) => // tslint:disable-line no-shadowed-variable
-      `const ${vids[output]} = formulas.${vids[output]}(${ params.map((p) => ids[p]).join(",") });`);
+    const calcs = ops.map(({ output, params, async }) => // tslint:disable-line no-shadowed-variable
+      `const ${vids[output]} = ${ async ? 'await' : '' } formulas.${vids[output]}(${ params.map((p) => ids[p]).join(",") });`);
 
     const retmap = returns.map((v) => `'${ v }':${ ids[v] }`);
 
     const body = `const ${ destructure } = args;\n${ calcs.join("\n") }\nreturn {${ retmap.join(",") }};`;
 
     // Compile the new function and bind statically-required values
+
+    const isAsync = ops.some(({ async }) => async);
+    const calculator = new (isAsync ? AsyncFunction : Function)("formulas", "args", body);
 
     const formulas: { [key: string]: Function } = {};
     for (const { outputs, fn } of deps.values()) {
@@ -85,7 +110,7 @@ export class Compiler {
       }
 
       return f(formulas, args);
-    }).bind(null, new Function("formulas", "args", body), formulas);
+    }).bind(null, calculator, formulas);
   }
 
   public getCalculator(reqs: Iterable<string>, precomputed: Iterable<string> = []) {
@@ -117,13 +142,13 @@ export class Compiler {
     return this.getCalculator(reqs, Object.keys(args))(args);
   }
 
-  public interpret(reqs: Iterable<string>, args: { [key: string]: unknown }): { [key: string]: unknown } {
+  public async interpret(reqs: Iterable<string>, args: { [key: string]: unknown }) {
     const { deps } = this;
-    args = { ...args };
+    const vals = { ...args };
 
     const ret: { [key: string]: unknown } = {};
     for (const val of reqs) {
-      ret[val] = calcValue(deps, val, args);
+      ret[val] = await calcValue(deps, val, vals);
     }
 
     return ret;
@@ -139,7 +164,7 @@ export class Compiler {
   // being individually extracted immediately before they
   // are needed by a formula.
   private *traverse(reqs: Iterable<string>, precomputed: Set<string>, visited: Set<string>):
-    Generator<{ computation?: { output: string, params: string[] }, input?: string }> {
+    Generator<{ computation?: { output: string, params: string[], async: boolean }, input?: string }> {
     const { deps } = this;
     for (const val of reqs) {
       // If we've seen this value before, we can bail,
@@ -170,7 +195,7 @@ export class Compiler {
         const params = op.inputs;
 
         yield* this.traverse(params, precomputed, visited);
-        yield { computation: { output: val, params } };
+        yield { computation: { output: val, params, async: !!op.async } };
       } else {
         yield { input: val }; // yield an input parameter
       }
@@ -184,7 +209,7 @@ export class Compiler {
   // and return the ordered operations and set of
   // required inputs.
   private linearize(reqs: Iterable<string>, precomputed: Iterable<string> = []) {
-    const ops: Array<{ output: string, params: string[] }> = [];
+    const ops: Array<{ output: string, params: string[], async: boolean }> = [];
     const intermediates = new Set<string>();
     const params: string[] = [];
 
