@@ -151,6 +151,7 @@ export class Compiler {
     // Destructure arguments
     const destructure = Object.entries(pids).map(([ key, value ]) => `'${key}':${ value }`).join(", ");
 
+    // Construct the function body
     const calcs: string[] = [];
 
     const synth_call = (output: string, params: string[]) =>
@@ -162,38 +163,33 @@ export class Compiler {
       }
     };
 
-    const async_block = (block: OpSpec[]) => {
-      if (block.length === 1) {
-        const { outputs, inputs } = block[0];
-        calcs.push(`const ${vids[outputs]} = await ${ synth_call(outputs, inputs) };`);
-      } else {
-        const outlist = block.map(o => vids[o.outputs]).join(',');
-        const exprlist = block.map(o => synth_call(o.outputs, o.inputs)).join(',');
-        calcs.push(`const [${outlist}] = await Promise.all([${exprlist}]);`);
-      }
-    };
-
-    let promises = 0;
-    const mixed_block = (a_block: OpSpec[], s_block: OpSpec[]) => {
-      if (a_block.length === 1) {
-        const { outputs, inputs } = a_block[0];
-        calcs.push(`const a${promises++} = ${ synth_call(outputs, inputs) };`);
-        sync_block(s_block);
-        calcs.push(`const ${vids[outputs]} = await a${promises};`);
-      } else {
-        const outlist = a_block.map(o => vids[o.outputs]).join(',');
-        const exprlist = a_block.map(o => synth_call(o.outputs, o.inputs)).join(',');
-        calcs.push(`const a${promises++} = Promise.all([${exprlist}]);`);
-        sync_block(s_block);
-        calcs.push(`const [${outlist}] = await ${promises};`);
-      }
-    };
-    
-    if (isAsync) {
+    if (isAsync) {  
+      let promises = 0;
       for (const [a_block, s_block] of blocks) {
         if (a_block.length) {
-          if (s_block.length) { mixed_block(a_block, s_block); }
-          else { async_block(a_block); }
+          if (s_block.length) { 
+            if (a_block.length === 1) {
+              const { outputs, inputs } = a_block[0];
+              calcs.push(`const a${promises++} = ${ synth_call(outputs, inputs) };`);
+              sync_block(s_block);
+              calcs.push(`const ${vids[outputs]} = await a${promises};`);
+            } else {
+              const outlist = a_block.map(o => vids[o.outputs]).join(',');
+              const exprlist = a_block.map(o => synth_call(o.outputs, o.inputs)).join(',');
+              calcs.push(`const a${promises++} = Promise.all([${exprlist}]);`);
+              sync_block(s_block);
+              calcs.push(`const [${outlist}] = await ${promises};`);
+            }
+          } else {
+            if (a_block.length === 1) {
+              const { outputs, inputs } = a_block[0];
+              calcs.push(`const ${vids[outputs]} = await ${ synth_call(outputs, inputs) };`);
+            } else {
+              const outlist = a_block.map(o => vids[o.outputs]).join(',');
+              const exprlist = a_block.map(o => synth_call(o.outputs, o.inputs)).join(',');
+              calcs.push(`const [${outlist}] = await Promise.all([${exprlist}]);`);
+            }
+          }
         } else {
           sync_block(s_block);
         }
@@ -204,11 +200,13 @@ export class Compiler {
       }
     }
 
+    // Repackage return values
     const retmap = returns.map((v) => `'${ v }':${ ids[v] }`);
 
     const source: SerializedFn = {
       isAsync, params, returns,
       formulas: vids,
+      // Destructure; execute; repackage
       body: `const {${ destructure }} = args;\n${ calcs.join("\n") }\nreturn {${ retmap.join(",") }};`,
     };
 
