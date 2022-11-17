@@ -23,7 +23,8 @@ async function calcValue(deps: Map<string, OpSpec>, req: string, vals: { [key: s
   if (vals.hasOwnProperty(req)) { return vals[req]; }
   const op = deps.get(req);
   if (!op) { throw { missing: req }; }
-  const args: unknown[] = await Promise.all(op.inputs.map((n) => calcValue(deps, n, vals)));
+  const args: unknown[] = [];
+  for (const n of op.inputs) { args.push(await calcValue(deps, n, vals)); }
   const val = await op.fn(...args);
   vals[req] = val;
   return val;
@@ -67,8 +68,9 @@ export class Compiler {
     const key = `${(reqs as string[]).join('\0')}\0\0${(precomputed as string[]).join('\0')}`;
     let ret = this.req_cache.get(key);
     if (!ret) {
-      const { intermediates, params } = this.linearize(reqs as string[], precomputed);
-      ret = { intermediates: [ ...intermediates ], params };
+      const { operations, params } = this.traverse(reqs as string[], new Set(precomputed));
+      const rset = new Set(reqs);
+      ret = { intermediates: [ ...operations.filter(v => !rset.has(v)) ], params };
       this.req_cache.set(key, ret);
     }
     return ret;
@@ -108,7 +110,6 @@ export class Compiler {
       this.fn_cache.set(rkey, pcache);
     }
     pcache.set(pkey, fn);
-    console.log(`cached ${rkey}, ${pkey}`);
     return fn;
   }
 
@@ -119,7 +120,7 @@ export class Compiler {
     // Get the linearized operation list
     // and set of required parameters to
     // compute the requested values.
-    const { ops, params, intermediates } = this.linearize(returns, pre);
+    const { blocks, params, intermediates } = this.linearize(returns, pre);
     const key = `${returns.join('\0')}\0\0${pre.join('\0')}`;
     this.req_cache.set(key, { intermediates: [ ...intermediates ], params });
 
@@ -131,28 +132,83 @@ export class Compiler {
       pids[param] = `v${ count++ }`;
     }
 
+    let isAsync = false;
     const vids: { [key: string]: string} = {};
-    for (const { output } of ops) {
-      vids[output] = `v${ count++ }`;
+    for (const [a_block, s_block] of blocks) {
+      for (const { outputs } of a_block) {
+        vids[outputs] = `v${ count++ }`;
+        isAsync = true;
+      }
+      for (const { outputs } of s_block) {
+        vids[outputs] = `v${ count++ }`;
+      }
     }
 
     const ids = { ...pids, ...vids };
 
-    // Assemble the function body
+    /* Assemble the function body */
 
+    // Destructure arguments
     const destructure = Object.entries(pids).map(([ key, value ]) => `'${key}':${ value }`).join(", ");
 
-    // TODO: batch concurrent async calls
-    const calcs = ops.map(({ output, params, async }) => // tslint:disable-line no-shadowed-variable
-      `const ${vids[output]} = ${ async ? "await" : "" } formulas.${vids[output]}(${ params.map((p) => ids[p]).join(",") });`);
+    const calcs: string[] = [];
+
+    const synth_call = (output: string, params: string[]) =>
+      `formulas.${vids[output]}(${ params.map((p) => ids[p]).join(",") })`;
+
+    const sync_block = (block: OpSpec[]) => {
+      for (const { outputs, inputs } of block) {
+        calcs.push(`const ${vids[outputs]} = ${ synth_call(outputs, inputs) };`);
+      }
+    };
+
+    const async_block = (block: OpSpec[]) => {
+      if (block.length === 1) {
+        const { outputs, inputs } = block[0];
+        calcs.push(`const ${vids[outputs]} = await ${ synth_call(outputs, inputs) };`);
+      } else {
+        const outlist = block.map(o => vids[o.outputs]).join(',');
+        const exprlist = block.map(o => synth_call(o.outputs, o.inputs)).join(',');
+        calcs.push(`const [${outlist}] = await Promise.all([${exprlist}]);`);
+      }
+    };
+
+    let promises = 0;
+    const mixed_block = (a_block: OpSpec[], s_block: OpSpec[]) => {
+      if (a_block.length === 1) {
+        const { outputs, inputs } = a_block[0];
+        calcs.push(`const a${promises++} = ${ synth_call(outputs, inputs) };`);
+        sync_block(s_block);
+        calcs.push(`const ${vids[outputs]} = await a${promises};`);
+      } else {
+        const outlist = a_block.map(o => vids[o.outputs]).join(',');
+        const exprlist = a_block.map(o => synth_call(o.outputs, o.inputs)).join(',');
+        calcs.push(`const a${promises++} = Promise.all([${exprlist}]);`);
+        sync_block(s_block);
+        calcs.push(`const [${outlist}] = await ${promises};`);
+      }
+    };
+    
+    if (isAsync) {
+      for (const [a_block, s_block] of blocks) {
+        if (a_block.length) {
+          if (s_block.length) { mixed_block(a_block, s_block); }
+          else { async_block(a_block); }
+        } else {
+          sync_block(s_block);
+        }
+      }
+    } else {
+      for (const [, s_block] of blocks) {
+        sync_block(s_block);
+      }
+    }
 
     const retmap = returns.map((v) => `'${ v }':${ ids[v] }`);
 
     const source: SerializedFn = {
-      params,
-      returns,
+      isAsync, params, returns,
       formulas: vids,
-      isAsync: ops.some(({ async }) => async),
       body: `const {${ destructure }} = args;\n${ calcs.join("\n") }\nreturn {${ retmap.join(",") }};`,
     };
 
@@ -205,76 +261,81 @@ export class Compiler {
     return ret;
   }
 
-  // Recursively traverse the dependency DAG encoded
-  // in the formal parameters of each formula, starting
-  // from the values requested, and emitting calculations
-  // in a reverse topological order. Values with no entry
-  // in the dependencies map are assumed to be inputs,
-  // and are distinguished so that they can be gathered
-  // at the top of the compiled function rather than
-  // being individually extracted immediately before they
-  // are needed by a formula.
-  private *traverse(reqs: string[], precomputed: Set<string>, visited: Set<string>):
-    Generator<{ computation?: { output: string, params: string[], async: boolean }, input?: string }> {
+  // Traverse the dependency DAG encoded in the formal
+  // parameters of each formula, starting from the values
+  // requested, and emitting calculations, in order to
+  // determine the complete sets of required inputs
+  // and intermediate calculations.
+  private traverse(reqs: string[], precomp: Set<string>)  {
+    const visited = new Set<string>();
+    const operations = [];
+    const params = [];
+    const stack = [ ...reqs ];
+    
     const { deps } = this;
-    for (const val of reqs) {
-      // If we've seen this value before, we can bail,
-      // because it will already have been calculated
-      // as a shared dependency of some other value
-      if (visited.has(val)) {
-        continue;
-      }
-
+    while (stack.length) {
+      const val = stack.pop()!;
+      if (visited.has(val)) { continue; }
       visited.add(val);
 
-      // This value is available pre-computed, so emit
-      // it as an input to notify the client that they
-      // must provide it, and don't bother with the
-      // rest of the dependency tree.
-      if (precomputed.has(val)) {
-        yield { input: val };
+      const op = deps.get(val);
+      if (!op || precomp.has(val)) {
+        params.push(val);
         continue;
       }
 
-      const op = deps.get(val);
-      if (op) {
-        // yield all of the dependencies for a formula,
-        // followed by the calculation itself, thus
-        // guaranteeing that all necessary values will
-        // have been precomputed before any formulas
-        // that use them.
-        const params = op.inputs;
-
-        yield* this.traverse(params, precomputed, visited);
-        yield { computation: { output: val, params, async: !!op.async } };
-      } else {
-        yield { input: val }; // yield an input parameter
-      }
+      operations.push(val);
+      stack.push(...op.inputs);
     }
+
+    params.sort();
+    return { operations, params };
   }
 
   // Linearize the the dependency DAG encoded in the
   // formal parameters of each formula and rooted at
-  // the requested values using the `traverse()`
-  // generator to produce a reverse topological sort,
-  // and return the ordered operations and set of
-  // required inputs.
+  // the requested values, grouping operations into
+  // blocks of synchronous and sync operations that
+  // can be performed concurrently.
   private linearize(reqs: string[], precomputed: Iterable<string> = []) {
-    const ops: Array<{ output: string, params: string[], async: boolean }> = [];
-    const intermediates = new Set<string>();
-    const params: string[] = [];
+    const computed = new Set<string>(precomputed);
+    const { params, operations } = this.traverse(reqs, computed);
+    for (const v of params) { computed.add(v); }
 
-    for (const { input, computation } of this.traverse(reqs, new Set(precomputed), new Set())) {
-      if (computation) {
-        ops.push(computation);
-        intermediates.add(computation.output);
-      } else if (input) {
-        params.push(input);
+    const { deps } = this;
+
+    // Copy OpSpecs so that we can mutate them.
+    let nodes = operations.map(v => {
+      const { inputs, outputs, async } = deps.get(v)!;
+      return { inputs: inputs, outputs, async: !!async };
+    });
+
+    const blocks: [OpSpec[], OpSpec[]][] = [];
+    while (nodes.length) {
+      const a_block: OpSpec[] = [];
+      const s_block: OpSpec[] = [];
+      const n_nodes: typeof nodes = [];
+      for (const node of nodes) {
+        // Split the remaining nodes into nodes that can't be
+        // evaluated yet, async nodes that can be evaluated now,
+        // and synchronous nodes that can be evaluated now.
+        node.inputs = node.inputs.filter(v => !computed.has(v));
+        if (node.inputs.length) {
+          n_nodes.push(node);
+        } else {
+          computed.add(node.outputs);
+          if (node.async) {
+            a_block.push(deps.get(node.outputs)!);
+          } else {
+            s_block.push(deps.get(node.outputs)!);
+          }
+        }
       }
+      blocks.push([a_block, s_block]);
+      nodes = n_nodes;
     }
 
-    params.sort();
-
-    return { ops, params, intermediates };
+    const rset = new Set(reqs);
+    return { blocks, params, intermediates: [ ...operations.filter(v => !rset.has(v)) ] };
   }
 }
