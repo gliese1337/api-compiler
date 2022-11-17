@@ -8,42 +8,42 @@ describe('Test Compilation', () => {
   it('should calculate required parameters for salesCost', () => {
     const { params } = cmp.getParams(['salesCost']);
     expect(params).to.eql([
-      'contractDiscRevShare',
-      'saleRate',
       'baseRate',
-      'upsideScale',
-      'contractLowRatePenalty',
       'contractDefPenalty',
+      'contractDiscRevShare',
+      'contractLowRatePenalty',
+      'saleRate',
+      'upsideScale',
     ]);
   });
 
   it('should calculate required parameters for defaultTrigger', () => {
-    const { params, intermediates } = cmp.getParams(['defaultTrigger']);
+    const { params } = cmp.getParams(['defaultTrigger']);
     expect(params).to.eql([
-      'saleRate',
       'saleEscFactor',
-      'utilityRate',
+      'saleRate',
       'utilityEscFactor',
+      'utilityRate',
     ]);
   });
 
   it('should calculate merged parameters', () => {
     const { params } = cmp.getParams(['salesCost','defaultTrigger']);
     expect(params).to.eql([
-      'contractDiscRevShare',
-      'saleRate',
       'baseRate',
-      'upsideScale',
-      'contractLowRatePenalty',
       'contractDefPenalty',
+      'contractDiscRevShare',
+      'contractLowRatePenalty',
       'saleEscFactor',
-      'utilityRate',
+      'saleRate',
+      'upsideScale',
       'utilityEscFactor',
+      'utilityRate',
     ]);
   });
 
   it('should correctly compile a calculator function', () => {
-    const calc = cmp.compile(['salesCost', 'upsideSlopeFactor']);
+    const [calc] = cmp.compile(['salesCost', 'upsideSlopeFactor']);
     expect(calc({
       'contractDiscRevShare': 0.5,
       'saleRate': 0.5,
@@ -69,44 +69,39 @@ describe('Test Compilation', () => {
   it('should revise requirements for salesCost given precomputed values', () => {
     const { params } = cmp.getParams(['salesCost'], ['upsideSlopeFactor']);
     expect(params).to.eql([
-      'contractDiscRevShare',
-      'upsideSlopeFactor',
-      'contractLowRatePenalty',
       'contractDefPenalty',
+      'contractDiscRevShare',
+      'contractLowRatePenalty',
+      'upsideSlopeFactor',
     ]);
   });
 
   it('should revise requirements for salesCost & defaultTrigger given precomputed values', () => {
     const { params } = cmp.getParams(['salesCost', 'defaultTrigger'], ['upsideSlopeFactor']);
     expect(params).to.eql([
-      'contractDiscRevShare',
-      'upsideSlopeFactor',
-      'contractLowRatePenalty',
       'contractDefPenalty',
-      "saleRate",
+      'contractDiscRevShare',
+      'contractLowRatePenalty',
       "saleEscFactor",
-      "utilityRate",
+      "saleRate",
+      'upsideSlopeFactor',
       "utilityEscFactor",
+      "utilityRate",
     ]);
   });
 
   it('should correctly compile a shortcut calculator function', () => {
-    const calc = cmp.compile(['salesCost'], ['upsideSlopeFactor']);
+    const [calc] = cmp.compile(['salesCost'], ['upsideSlopeFactor']);
     expect(calc({
       'contractDiscRevShare': 0.5,
       'upsideSlopeFactor': 1,
       'contractLowRatePenalty': 0.5,
       'contractDefPenalty': 0.5,
     })).to.eql({ salesCost: -0.5 });
-    try {
-      calc({
-        'contractDiscRevShare': 0.5,
-        'contractLowRatePenalty': 0.5,
-        'contractDefPenalty': 0.5,
-      });
-      expect(true).to.equal(false);
-    } catch (e) {
-      expect(e.message).to.equal("Missing arguments: Calculating [salesCost] requires [upsideSlopeFactor] as input");
-    }
+    expect(() => calc({
+      'contractDiscRevShare': 0.5,
+      'contractLowRatePenalty': 0.5,
+      'contractDefPenalty': 0.5,
+    })).to.throw(Error, "Missing arguments: Calculating [salesCost] requires [upsideSlopeFactor] as input");
   });
 });

@@ -5,6 +5,14 @@ export interface OpSpec {
   async?: boolean;
 }
 
+export interface SerializedFn {
+  formulas: Record<string,string>;
+  params: string[];
+  returns: string[];
+  isAsync: boolean;
+  body: string;
+}
+
 function *reverseDependencies(deps: Iterable<OpSpec>, params: Set<string>) {
   for (const { outputs, inputs } of deps) {
     if (inputs.some((i) => params.has(i))) { yield outputs; }
@@ -26,7 +34,8 @@ const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 
 export class Compiler {
   private deps = new Map<string, OpSpec>();
-  private cache = new Map<string, Function>();
+  private fn_cache = new Map<string, Map<string, Function>>();
+  private req_cache = new Map<string, { intermediates: string[]; params: string[]; }>();
 
   constructor(optable: Iterable<Function | OpSpec>) {
     for (const spec of optable) {
@@ -53,20 +62,66 @@ export class Compiler {
   }
 
   public getParams(reqs: Iterable<string>, precomputed: Iterable<string> = []) {
-    const { intermediates, params } = this.linearize(reqs, precomputed);
-
-    return { intermediates: [ ...intermediates ], params };
+    reqs = [...reqs].sort();
+    precomputed = [...precomputed].sort();
+    const key = `${(reqs as string[]).join('\0')}\0\0${(precomputed as string[]).join('\0')}`;
+    let ret = this.req_cache.get(key);
+    if (!ret) {
+      const { intermediates, params } = this.linearize(reqs as string[], precomputed);
+      ret = { intermediates: [ ...intermediates ], params };
+      this.req_cache.set(key, ret);
+    }
+    return ret;
   }
 
-  public compile(reqs: Iterable<string>, precomputed: Iterable<string> = []) {
-    precomputed = [ ...precomputed ];
-    const returns = [ ...reqs ];
+  public loadSource(source: string | SerializedFn) {
+    if (typeof source === 'string') {
+      source = JSON.parse(source) as SerializedFn;
+    }
+
+    const { formulas: required_formulas, params, returns, isAsync, body } = source;
     const { deps } = this;
+
+    const formulas: { [key: string]: Function } = {};
+    for (const [k, v] of Object.entries(required_formulas)) {
+      formulas[v] = deps.get(k)!.fn;
+    }
+
+    const calculator = new (isAsync ? AsyncFunction : Function)("formulas", "args", body);
+
+    // tslint:disable-next-line no-shadowed-variable
+    const fn = (function(f: Function, formulas: { [key: string]: Function }, args: { [key: string]: unknown }) {
+      const missing = params.filter((p) => !args.hasOwnProperty(p));
+      if (missing.length) {
+        const uncalculable = [ ...reverseDependencies(deps.values(), new Set(missing)) ];
+        throw new Error(`Missing arguments: Calculating [${ uncalculable.join(", ") }] requires [${ missing.join(", ") }] as input`);
+      }
+
+      return f(formulas, args);
+    }).bind(null, calculator, formulas);
+
+    const rkey = returns.sort().join('\0');
+    const pkey = params.sort().join('\0');
+    let pcache = this.fn_cache.get(rkey);
+    if (!pcache) {
+      pcache = new Map();
+      this.fn_cache.set(rkey, pcache);
+    }
+    pcache.set(pkey, fn);
+    console.log(`cached ${rkey}, ${pkey}`);
+    return fn;
+  }
+
+  public compile(reqs: Iterable<string>, precomputed: Iterable<string> = []): [Function, SerializedFn] {
+    const pre = [ ...precomputed ].sort();
+    const returns = [ ...reqs ].sort();
 
     // Get the linearized operation list
     // and set of required parameters to
     // compute the requested values.
-    const { ops, params } = this.linearize(returns, precomputed);
+    const { ops, params, intermediates } = this.linearize(returns, pre);
+    const key = `${returns.join('\0')}\0\0${pre.join('\0')}`;
+    this.req_cache.set(key, { intermediates: [ ...intermediates ], params });
 
     // Generate maps from arbitrary API value names to valid JS identifiers
 
@@ -87,57 +142,42 @@ export class Compiler {
 
     const destructure = Object.entries(pids).map(([ key, value ]) => `'${key}':${ value }`).join(", ");
 
+    // TODO: batch concurrent async calls
     const calcs = ops.map(({ output, params, async }) => // tslint:disable-line no-shadowed-variable
       `const ${vids[output]} = ${ async ? "await" : "" } formulas.${vids[output]}(${ params.map((p) => ids[p]).join(",") });`);
 
     const retmap = returns.map((v) => `'${ v }':${ ids[v] }`);
 
-    const body = `const {${ destructure }} = args;\n${ calcs.join("\n") }\nreturn {${ retmap.join(",") }};`;
+    const source: SerializedFn = {
+      params,
+      returns,
+      formulas: vids,
+      isAsync: ops.some(({ async }) => async),
+      body: `const {${ destructure }} = args;\n${ calcs.join("\n") }\nreturn {${ retmap.join(",") }};`,
+    };
 
-    // Compile the new function and bind statically-required values
-
-    const isAsync = ops.some(({ async }) => async);
-    const calculator = new (isAsync ? AsyncFunction : Function)("formulas", "args", body);
-
-    const formulas: { [key: string]: Function } = {};
-    for (const { outputs, fn } of deps.values()) {
-      formulas[vids[outputs]] = fn;
-    }
-
-    // tslint:disable-next-line no-shadowed-variable
-    return (function(f: Function, formulas: { [key: string]: Function }, args: { [key: string]: unknown }) {
-      const missing = params.filter((p) => !args.hasOwnProperty(p));
-      if (missing.length) {
-        const uncalculable = [ ...reverseDependencies(deps.values(), new Set(missing)) ];
-        throw new Error(`Missing arguments: Calculating [${ uncalculable.join(", ") }] requires [${ missing.join(", ") }] as input`);
-      }
-
-      return f(formulas, args);
-    }).bind(null, calculator, formulas);
+    return [this.loadSource(source), source];
   }
 
   public getCalculator(reqs: Iterable<string>, precomputed: Iterable<string> = []) {
     const returns = [ ...reqs ];
-    const { cache } = this;
-
-    let key = returns.sort().join("\0");
-    let f: Function | undefined;
-
     const pre = [ ...precomputed ];
-    if (pre.length > 0) {
-      const { params } = this.getParams(returns, precomputed);
-      key += "\0\0" + pre.filter((n) => params.includes(n)).sort().join("\0");
-      f = cache.get(key);
-      if (f) { return f; }
-      f = this.compile(returns, pre);
-    } else {
-      f = cache.get(key);
-      if (f) { return f; }
-      f = this.compile(returns);
+    const { fn_cache } = this;
+
+    const rkey = returns.sort().join("\0");
+    const pcache = fn_cache.get(rkey);
+    if (!pcache) { // no cache, so we need to compile
+      const [f] = this.compile(returns, pre);
+      return f;
     }
+    
+    const { params } = this.getParams(returns, pre);
+    const pkey = params.join('\0');
 
-    cache.set(key, f);
-
+    let f = pcache.get(pkey);
+    if (!f) { // only suboptimal versions cached, so we need to compile
+      [f] = this.compile(returns, pre);
+    }
     return f;
   }
 
@@ -154,8 +194,8 @@ export class Compiler {
       try {
         ret[val] = await calcValue(deps, val, vals);
       } catch (e) {
-        if (e.missing) {
-          throw new Error(`Cannot calculate [${ val }]; missing required input [${ e.missing }].`);
+        if ((e as any).missing) {
+          throw new Error(`Cannot calculate [${ val }]; missing required input [${ (e as any).missing }].`);
         }
 
         throw e;
@@ -174,7 +214,7 @@ export class Compiler {
   // at the top of the compiled function rather than
   // being individually extracted immediately before they
   // are needed by a formula.
-  private *traverse(reqs: Iterable<string>, precomputed: Set<string>, visited: Set<string>):
+  private *traverse(reqs: string[], precomputed: Set<string>, visited: Set<string>):
     Generator<{ computation?: { output: string, params: string[], async: boolean }, input?: string }> {
     const { deps } = this;
     for (const val of reqs) {
@@ -219,7 +259,7 @@ export class Compiler {
   // generator to produce a reverse topological sort,
   // and return the ordered operations and set of
   // required inputs.
-  private linearize(reqs: Iterable<string>, precomputed: Iterable<string> = []) {
+  private linearize(reqs: string[], precomputed: Iterable<string> = []) {
     const ops: Array<{ output: string, params: string[], async: boolean }> = [];
     const intermediates = new Set<string>();
     const params: string[] = [];
@@ -232,6 +272,8 @@ export class Compiler {
         params.push(input);
       }
     }
+
+    params.sort();
 
     return { ops, params, intermediates };
   }

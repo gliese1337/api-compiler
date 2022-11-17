@@ -1,6 +1,6 @@
 {
   "name": "api-compiler",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Treat APIs as declarative programming languages.",
   "main": "dist/compiler.js",
   "types": "dist/compiler.d.ts",
@@ -32,8 +32,7 @@
   "homepage": "https://github.com/gliese1337/api-compiler#readme",
   "devDependencies": {
     "chai": "^4.1.2",
-    "mocha": "^6.2.0",
-    "typescript": "^3.6.2"
-  },
-  "dependencies": {}
+    "mocha": "^10.1.0",
+    "typescript": "^3.9.10"
+  }
 }
